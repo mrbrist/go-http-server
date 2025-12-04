@@ -1,5 +1,11 @@
 include .env
 
+run:
+	go run .
+
+generatesql:
+	sqlc generate
+
 psql:
 	psql $(DB_URL)
 

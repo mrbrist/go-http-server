@@ -1,18 +1,16 @@
-package main
+package util
 
 import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"slices"
-	"strings"
 )
 
 type errorRes struct {
 	Error string `json:"error,omitempty"`
 }
 
-func respondWithError(w http.ResponseWriter, code int, msg string) {
+func RespondWithError(w http.ResponseWriter, code int, msg string) {
 	res := errorRes{Error: msg}
 	dat, err := json.Marshal(res)
 	if err != nil {
@@ -25,7 +23,7 @@ func respondWithError(w http.ResponseWriter, code int, msg string) {
 	w.Write(dat)
 }
 
-func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+func RespondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	dat, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("Error marshalling JSON: %s", err)
@@ -35,16 +33,4 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	w.Write(dat)
-}
-
-func CleanString(s string) string {
-	bannedWords := []string{"kerfuffle", "sharbert", "fornax"}
-	split := strings.Split(s, " ")
-	for i, w := range split {
-		if slices.Contains(bannedWords, strings.ToLower(w)) {
-			split[i] = "****"
-		}
-	}
-
-	return strings.Join(split, " ")
 }
