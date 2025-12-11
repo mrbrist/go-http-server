@@ -14,3 +14,6 @@ gooseup:
 
 goosedown:
 	goose postgres $(DB_URL) -dir "sql/schema" down
+
+test:
+	go test ./...
