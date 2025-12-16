@@ -24,6 +24,7 @@ type apiConfig struct {
 	db             *database.Queries
 	platform       string
 	jwt_secret     string
+	polka_apikey   string
 }
 
 type User struct {
@@ -33,6 +34,7 @@ type User struct {
 	Email        string    `json:"email"`
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 }
 
 func main() {
@@ -40,6 +42,7 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
 	jwt_secret := os.Getenv("JWT_SECRET")
+	polka_apikey := os.Getenv("POLKA_KEY")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal(err)
@@ -50,24 +53,29 @@ func main() {
 	const filepathAssets = "./assets"
 	const port = "8080"
 
-	apiCfg := apiConfig{db: dbQueries, platform: platform, jwt_secret: jwt_secret}
+	apiCfg := apiConfig{db: dbQueries, platform: platform, jwt_secret: jwt_secret, polka_apikey: polka_apikey}
 
 	httpServeMux := http.NewServeMux()
 	httpServeMux.Handle("/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir(filepathRoot)))))
 	httpServeMux.Handle("/api", apiCfg.middlewareMetricsInc(http.StripPrefix("/api", http.FileServer(http.Dir(filepathAssets)))))
+
 	httpServeMux.HandleFunc("GET /api/healthz", readinessHandler)
 	httpServeMux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	httpServeMux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
 	// httpServeMux.HandleFunc("POST /api/validate_chirp", apiCfg.validateHandler)
-	httpServeMux.HandleFunc("POST /api/users", apiCfg.createUser)
+
 	httpServeMux.HandleFunc("POST /api/chirps", apiCfg.createChirp)
 	httpServeMux.HandleFunc("GET /api/chirps", apiCfg.getAllChirps)
 	httpServeMux.HandleFunc("GET /api/chirps/{chirpId}", apiCfg.getChirp)
+	httpServeMux.HandleFunc("DELETE /api/chirps/{chirpId}", apiCfg.deleteChirp)
+
 	httpServeMux.HandleFunc("POST /api/login", apiCfg.handleLogin)
 	httpServeMux.HandleFunc("POST /api/refresh", apiCfg.refreshToken)
 	httpServeMux.HandleFunc("POST /api/revoke", apiCfg.revokeToken)
 	httpServeMux.HandleFunc("PUT /api/users", apiCfg.updateUser)
-	httpServeMux.HandleFunc("DELETE /api/chirps/{chirpId}", apiCfg.deleteChirp)
+	httpServeMux.HandleFunc("POST /api/users", apiCfg.createUser)
+
+	httpServeMux.HandleFunc("POST /api/polka/webhooks", apiCfg.polkaWebhook)
 
 	server := http.Server{
 		Handler: httpServeMux,
@@ -142,10 +150,11 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, req *http.Request) {
 	}
 
 	util.RespondWithJSON(w, 201, User{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
+		ID:          user.ID,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		Email:       user.Email,
+		IsChirpyRed: user.IsChirpyRed.Bool,
 	})
 }
 
@@ -213,7 +222,34 @@ func (cfg *apiConfig) getAllChirps(w http.ResponseWriter, req *http.Request) {
 		UserID    uuid.UUID `json:"user_id"`
 	}
 
-	chirps, err := cfg.db.GetAllChirps(req.Context())
+	author := req.URL.Query().Get("author_id")
+	sort := req.URL.Query().Get("sort")
+
+	if author != "" {
+		uuid, err := uuid.Parse(author)
+		if err != nil {
+			util.RespondWithError(w, 500, err.Error())
+			return
+		}
+		chirps, err := cfg.db.GetAllChirpsForUser(req.Context(), database.GetAllChirpsForUserParams{
+			UserID:  uuid,
+			Column2: sort,
+		})
+		if err != nil {
+			util.RespondWithError(w, 500, err.Error())
+			return
+		}
+
+		newSlice := make([]returnVals, len(chirps))
+		for i, c := range chirps {
+			newSlice[i] = returnVals(c)
+		}
+
+		util.RespondWithJSON(w, 200, newSlice)
+		return
+	}
+
+	chirps, err := cfg.db.GetAllChirps(req.Context(), sort)
 	if err != nil {
 		util.RespondWithError(w, 500, err.Error())
 		return
@@ -302,6 +338,7 @@ func (cfg *apiConfig) handleLogin(w http.ResponseWriter, req *http.Request) {
 			Email:        user.Email,
 			Token:        token,
 			RefreshToken: refresh_token,
+			IsChirpyRed:  user.IsChirpyRed.Bool,
 		})
 	} else {
 		util.RespondWithError(w, 401, "Incorrect email or password")
@@ -453,6 +490,52 @@ func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, req *http.Request) {
 	err = cfg.db.DeleteChrip(context.Background(), uuid)
 	if err != nil {
 		util.RespondWithError(w, 500, err.Error())
+		return
+	}
+
+	w.WriteHeader(204)
+}
+
+func (cfg *apiConfig) polkaWebhook(w http.ResponseWriter, req *http.Request) {
+	type parameters struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID string `json:"user_id"`
+		} `json:"data"`
+	}
+
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	if err := decoder.Decode(&params); err != nil {
+		util.RespondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	key, err := auth.GetAPIKey(req.Header)
+	if err != nil {
+		util.RespondWithError(w, 401, err.Error())
+		return
+	}
+
+	if key != cfg.polka_apikey {
+		w.WriteHeader(401)
+		return
+	}
+
+	if params.Event != "user.upgraded" {
+		w.WriteHeader(204)
+		return
+	}
+
+	uuid, err := uuid.Parse(params.Data.UserID)
+	if err != nil {
+		util.RespondWithError(w, 500, err.Error())
+		return
+	}
+
+	err = cfg.db.UpgradeUser(context.Background(), uuid)
+	if err != nil {
+		util.RespondWithError(w, 404, err.Error())
 		return
 	}
 
